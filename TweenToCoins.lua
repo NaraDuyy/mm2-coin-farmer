@@ -1030,6 +1030,91 @@ local function hopServer()
 	unfreezeCharacter()
 end
 
+-- =========================
+-- Emergency hop on kick / disconnect / error
+-- =========================
+-- Roblox shows a "you were kicked" / "lost connection" UI any time
+-- the client gets booted (anti-cheat reset, server crash, network
+-- loss, "Disconnected: invalid position", etc.). The error text
+-- surfaces through GuiService — we listen for it and immediately
+-- TeleportService:Teleport into a fresh server. NetworkClient
+-- removal also catches socket-level disconnects.
+do
+	local GuiService    = game:GetService("GuiService")
+	local CoreGui       = game:GetService("CoreGui")
+	local hopAttempted  = false
+
+	local function emergencyHop(reason)
+		if hopAttempted then return end
+		hopAttempted = true
+		warn(("[CoinTween] Emergency hop: %s"):format(tostring(reason)))
+		pcall(setStatus, "Emergency hop: " .. tostring(reason))
+
+		task.spawn(function()
+			local placeId = game.PlaceId
+			-- Try a populated server first, fall back to matchmaker.
+			local triedSpecific = false
+			pcall(function()
+				local servers = fetchServerList and fetchServerList()
+				if servers then
+					table.sort(servers, function(a, b)
+						return (a.playing or 0) > (b.playing or 0)
+					end)
+					for _, s in ipairs(servers) do
+						if s.id and s.id ~= game.JobId
+						   and (s.playing or 0) >= MIN_PLAYERS
+						   and (s.playing or 0) < (s.maxPlayers or 0) then
+							TeleportService:TeleportToPlaceInstance(placeId, s.id, LocalPlayer)
+							triedSpecific = true
+							return
+						end
+					end
+				end
+			end)
+			if not triedSpecific then
+				pcall(function() TeleportService:Teleport(placeId, LocalPlayer) end)
+			end
+		end)
+	end
+
+	-- 1) GuiService error message changes — covers "kicked", "lost
+	-- connection", "invalid position", "place is full", etc.
+	GuiService.ErrorMessageChanged:Connect(function()
+		local ok, msg = pcall(function() return GuiService:GetErrorMessage() end)
+		if ok and msg and msg ~= "" then
+			emergencyHop("error: " .. msg)
+		end
+	end)
+
+	-- 2) Network-level disconnect: NetworkClient's child object
+	-- disappears when the client's socket drops.
+	local nc = game:FindFirstChildOfClass("NetworkClient")
+	if nc then
+		nc.ChildRemoved:Connect(function()
+			emergencyHop("NetworkClient child removed")
+		end)
+	end
+
+	-- 3) Roblox's kick/disconnect prompt has a predictable name in
+	-- CoreGui. If it appears, hop immediately instead of waiting on
+	-- the user to click Leave/Reconnect.
+	local function watchPrompt(d)
+		if d and d.Name == "ErrorPrompt" then
+			emergencyHop("ErrorPrompt UI shown")
+		end
+	end
+	for _, d in ipairs(CoreGui:GetDescendants()) do watchPrompt(d) end
+	CoreGui.DescendantAdded:Connect(watchPrompt)
+
+	-- 4) TeleportService failures — sometimes the hop itself fails
+	-- (e.g., target server is full). Try a vanilla teleport as fallback.
+	TeleportService.TeleportInitFailed:Connect(function(_, _, errorMsg)
+		warn(("[CoinTween] TeleportInitFailed: %s — retrying vanilla."):format(tostring(errorMsg)))
+		hopAttempted = false   -- allow another attempt
+		emergencyHop("teleport init failed: " .. tostring(errorMsg))
+	end)
+end
+
 -- Periodic population check
 task.spawn(function()
 	while not stopped do
