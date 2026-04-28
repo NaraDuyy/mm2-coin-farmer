@@ -38,6 +38,123 @@ end
 if not isLikelyMM2() then return end
 
 -- =========================
+-- Device detection + first-run prompt
+-- =========================
+-- The script supports PC / Mobile / iPad. Some UI paths differ between
+-- desktop and small-screen layouts (e.g. the account-coin label sits
+-- under CrossPlatform.Shop.Medium on PC vs CrossPlatform.Shop.Small on
+-- phone). On first run we ask the user which device they're on and
+-- save the choice; subsequent runs skip the prompt.
+local DEVICE_FILE   = "TweenToCoins_device.txt"   -- written via executor's writefile
+local DEVICE        = nil   -- "pc" | "mobile" | "ipad"
+
+local function safeRead(path)
+	local ok, val = pcall(function() return readfile(path) end)
+	if ok and val and #val > 0 then return val end
+	return nil
+end
+local function safeWrite(path, content)
+	pcall(function() writefile(path, content) end)
+end
+
+-- Restore saved device.
+local saved = safeRead(DEVICE_FILE)
+if saved == "pc" or saved == "mobile" or saved == "ipad" then
+	DEVICE = saved
+end
+
+-- Auto-detect as a fallback. Heuristic: TouchEnabled + no MouseEnabled
+-- = mobile. Screen aspect ratio hints at iPad vs phone.
+local function autoDetectDevice()
+	local UIS = game:GetService("UserInputService")
+	if UIS.TouchEnabled and not UIS.MouseEnabled then
+		local cam = workspace.CurrentCamera
+		if cam then
+			local size = cam.ViewportSize
+			local aspect = size.X / size.Y
+			-- iPads tend toward 4:3 (~1.33), phones toward 16:9 (~1.78).
+			if aspect < 1.5 then return "ipad" end
+		end
+		return "mobile"
+	end
+	return "pc"
+end
+
+-- Show a one-time GUI prompt asking the user to confirm device.
+local function askDevice()
+	local LocalPlayer = game:GetService("Players").LocalPlayer
+	local CoreGui     = game:GetService("CoreGui")
+	local promptGui = Instance.new("ScreenGui")
+	promptGui.Name = "MM2DevicePrompt"
+	promptGui.IgnoreGuiInset = true
+	promptGui.ResetOnSpawn = false
+	promptGui.DisplayOrder = 1000
+	pcall(function() promptGui.Parent = CoreGui end)
+	if not promptGui.Parent then promptGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+	local backdrop = Instance.new("Frame")
+	backdrop.Size = UDim2.fromScale(1, 1)
+	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
+	backdrop.BackgroundTransparency = 0.4
+	backdrop.Parent = promptGui
+
+	local panel = Instance.new("Frame")
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.Position = UDim2.fromScale(0.5, 0.5)
+	panel.Size = UDim2.fromOffset(360, 220)
+	panel.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+	panel.BorderSizePixel = 0
+	panel.Parent = backdrop
+	local corner = Instance.new("UICorner") corner.CornerRadius = UDim.new(0, 12) corner.Parent = panel
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 50)
+	title.Position = UDim2.new(0, 0, 0, 10)
+	title.BackgroundTransparency = 1
+	title.Text = "Which device are you on?"
+	title.TextColor3 = Color3.fromRGB(255, 215, 75)
+	title.Font = Enum.Font.GothamBlack
+	title.TextSize = 22
+	title.Parent = panel
+
+	local choice = nil
+	local function makeButton(label, val, x)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(100, 100)
+		b.Position = UDim2.fromOffset(x, 80)
+		b.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+		b.Text = label
+		b.TextColor3 = Color3.fromRGB(240, 240, 240)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 18
+		b.Parent = panel
+		local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 8) c.Parent = b
+		b.MouseButton1Click:Connect(function() choice = val end)
+		b.TouchTap:Connect(function() choice = val end)
+		return b
+	end
+	makeButton("PC",     "pc",     20)
+	makeButton("Mobile", "mobile", 130)
+	makeButton("iPad",   "ipad",   240)
+
+	-- Block until a choice is made (or 30s timeout, then fall back to autodetect).
+	local started = tick()
+	while not choice and tick() - started < 30 do task.wait(0.1) end
+	promptGui:Destroy()
+	return choice or autoDetectDevice()
+end
+
+if not DEVICE then
+	DEVICE = askDevice()
+	safeWrite(DEVICE_FILE, DEVICE)
+	print(("[CoinTween] Device set to %s (saved)"):format(DEVICE))
+else
+	print(("[CoinTween] Device loaded: %s"):format(DEVICE))
+end
+
+local IS_MOBILE = (DEVICE == "mobile" or DEVICE == "ipad")
+
+-- =========================
 -- Config
 -- =========================
 local FALLBACK_WALKSPEED = 25    -- slower = more physics ticks of coin
@@ -619,9 +736,17 @@ end
 --   PlayerGui.CrossPlatform.Shop.Medium.Title.Coins.Container.Amount.Text
 -- We bind to that TextLabel's Text property and listen for changes so the
 -- dashboard mirrors whatever the game shows.
-local COIN_LABEL_PATH = {
+-- Account-coin label paths differ between desktop and mobile/ipad.
+-- We try the device-preferred path first, then fall back to the others.
+local COIN_LABEL_PATH_PC = {
 	"CrossPlatform", "Shop", "Medium", "Title", "Coins", "Container", "Amount",
 }
+local COIN_LABEL_PATH_MOBILE = {
+	"CrossPlatform", "Shop", "Small", "Container", "Title", "Container", "Coins", "Container", "Amount",
+}
+local COIN_LABEL_PATHS = IS_MOBILE
+	and { COIN_LABEL_PATH_MOBILE, COIN_LABEL_PATH_PC }
+	or  { COIN_LABEL_PATH_PC, COIN_LABEL_PATH_MOBILE }
 -- accountCoinsText / accountCoinsNum / coinTextLabel are forward-declared
 -- in the Stats section above so closures there capture the correct upvalues.
 
@@ -655,14 +780,17 @@ end
 local function findCoinLabel()
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	if not pg then return nil end
-	local node = pg
-	for _, name in ipairs(COIN_LABEL_PATH) do
-		node = node:FindFirstChild(name)
-		if not node then return nil end
-	end
-	-- Final node should be a TextLabel (or anything with a Text property).
-	if node:IsA("TextLabel") or node:IsA("TextBox") or node:IsA("TextButton") then
-		return node
+	-- Try every device's path in priority order; first hit wins.
+	for _, path in ipairs(COIN_LABEL_PATHS) do
+		local node = pg
+		local ok = true
+		for _, name in ipairs(path) do
+			node = node:FindFirstChild(name)
+			if not node then ok = false; break end
+		end
+		if ok and node and (node:IsA("TextLabel") or node:IsA("TextBox") or node:IsA("TextButton")) then
+			return node
+		end
 	end
 	return nil
 end
@@ -721,8 +849,13 @@ end)
 -- number, and listen for property changes. This is the authoritative
 -- source for the bag-fill display and the auto-reset trigger; the local
 -- bagCount falls back if the label isn't found (lobby state, etc.).
-local BAG_LABEL_PATH = {
-	"MainGUI", "Game", "CoinBags", "Container", "Coin", "CurrencyFrame", "Icon", "Coins",
+-- Bag label sits at the same MainGUI tree on both desktop and mobile,
+-- but the dump shows two possible parents — `Container` (runtime alias
+-- created by CoinBagContainerScript) or `CoinBagContainerScript` (the
+-- raw script instance). Try both.
+local BAG_LABEL_PATHS = {
+	{ "MainGUI", "Game", "CoinBags", "Container",                "Coin", "CurrencyFrame", "Icon", "Coins" },
+	{ "MainGUI", "Game", "CoinBags", "CoinBagContainerScript",   "Coin", "CurrencyFrame", "Icon", "Coins" },
 }
 local bagLabel    = nil
 local bagFromUI   = nil   -- nil if not yet bound; number once we have a reading
@@ -730,8 +863,28 @@ local bagFromUI   = nil   -- nil if not yet bound; number once we have a reading
 local function findBagLabel()
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	if not pg then return nil end
+	for _, path in ipairs(BAG_LABEL_PATHS) do
+		local node = pg
+		local ok = true
+		for _, name in ipairs(path) do
+			node = node:FindFirstChild(name)
+			if not node then ok = false; break end
+		end
+		if ok and node and (node:IsA("TextLabel") or node:IsA("TextBox") or node:IsA("TextButton")) then
+			return node
+		end
+	end
+	return nil
+end
+
+-- The original single-path findBagLabel definition that follows is dead
+-- code now (the if/return block below); leaving the structure intact so
+-- we don't break the surrounding control flow.
+local function _findBagLabel_legacy_unused()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if not pg then return nil end
 	local node = pg
-	for _, name in ipairs(BAG_LABEL_PATH) do
+	for _, name in ipairs(BAG_LABEL_PATHS[1]) do
 		node = node:FindFirstChild(name)
 		if not node then return nil end
 	end
@@ -1593,8 +1746,109 @@ local function countInRange(originPos)
 	return n
 end
 
-print(("[CoinTween] Started. Radius=%d  MaxBag=%d  MinPlayers=%d  Stop=%s  ToggleGUI=%s")
-	:format(RADIUS, MAX_BAG, MIN_PLAYERS, STOP_KEY.Name, TOGGLE_GUI_KEY.Name))
+-- =========================
+-- Auto-buy (emotes / gears / perks / pets / knives / guns)
+-- =========================
+-- Periodically sweep the runtime item catalogs in ReplicatedStorage
+-- and call BuyItemNew on each item we haven't tried yet. Best-effort:
+-- without exact source for MM2's shop modules, we discover items by
+-- require()ing the loaded modules and iterating their tables. The
+-- buy remote is fired in pcall so failures don't crash the loop.
+local AUTO_BUY               = true
+local AUTO_BUY_INTERVAL      = 90    -- seconds between full catalog sweeps
+local AUTO_BUY_RATE          = 0.3   -- delay between individual buy attempts (anti-spam)
+local AUTO_BUY_CATEGORIES    = {     -- ModuleScript names under Database.Sync
+	"Emotes", "Effects", "Toys", "Pets", "Knives", "Guns", "Shop", "Item",
+}
+
+task.spawn(function()
+	if not AUTO_BUY then return end
+
+	-- Resolve the buy remote. BuyItemNew is preferred (modern MM2);
+	-- BuyItem is the legacy version. Both are RemoteFunctions.
+	local rs       = game:GetService("ReplicatedStorage")
+	local remotes  = rs:FindFirstChild("Remotes")
+	local shop     = remotes and remotes:FindFirstChild("Shop")
+	local buyNew   = shop and shop:FindFirstChild("BuyItemNew")
+	local buyOld   = shop and shop:FindFirstChild("BuyItem")
+	if not (buyNew or buyOld) then
+		warn("[CoinTween] AutoBuy: no BuyItemNew or BuyItem remote — disabled.")
+		return
+	end
+
+	-- Resolve the item catalog. Database.Sync.<Category> are
+	-- ModuleScripts that return a table of items when require()d.
+	local db    = rs:FindFirstChild("Database")
+	local sync  = db and db:FindFirstChild("Sync")
+	if not sync then
+		warn("[CoinTween] AutoBuy: ReplicatedStorage.Database.Sync not found — disabled.")
+		return
+	end
+
+	local tried = {}   -- [itemName] = true (one attempt per item per session)
+
+	local function tryBuy(itemName)
+		if tried[itemName] then return end
+		tried[itemName] = true
+		-- Try BuyItemNew first, then fall back to BuyItem. Both with
+		-- (itemName) as the only arg — that's the most common signature
+		-- across MM2 versions. If neither works the function fails
+		-- silently and we move on.
+		if buyNew then
+			local ok, result = pcall(function()
+				return buyNew:InvokeServer(itemName)
+			end)
+			if ok and result then
+				print(("[CoinTween] Bought: %s (BuyItemNew → %s)"):format(itemName, tostring(result)))
+				return
+			end
+		end
+		if buyOld then
+			pcall(function() buyOld:InvokeServer(itemName) end)
+		end
+	end
+
+	-- Recursively iterate a table to find string keys that look like
+	-- item identifiers. Many MM2 modules nest items under sub-categories.
+	local function collectItems(t, out, depth)
+		if type(t) ~= "table" or depth > 3 then return end
+		for k, v in pairs(t) do
+			if type(k) == "string" and k:len() > 1 and k:len() < 64 then
+				-- Heuristic: looks like an item name (alphanumeric + spaces)
+				if k:match("^[%w%s%-_'.]+$") then
+					out[#out + 1] = k
+				end
+			end
+			if type(v) == "table" then collectItems(v, out, depth + 1) end
+		end
+	end
+
+	while not stopped do
+		local totalTried = 0
+		for _, cat in ipairs(AUTO_BUY_CATEGORIES) do
+			local module = sync:FindFirstChild(cat)
+			if module then
+				local ok, contents = pcall(require, module)
+				if ok and type(contents) == "table" then
+					local items = {}
+					collectItems(contents, items, 1)
+					for _, itemName in ipairs(items) do
+						if stopped then break end
+						tryBuy(itemName)
+						totalTried = totalTried + 1
+						task.wait(AUTO_BUY_RATE)
+					end
+				end
+			end
+			if stopped then break end
+		end
+		print(("[CoinTween] AutoBuy sweep done — %d items attempted (cumulative)."):format(totalTried))
+		task.wait(AUTO_BUY_INTERVAL)
+	end
+end)
+
+print(("[CoinTween] Started. Device=%s Radius=%d MaxBag=%d MinPlayers=%d Stop=%s ToggleGUI=%s")
+	:format(DEVICE, RADIUS, MAX_BAG, MIN_PLAYERS, STOP_KEY.Name, TOGGLE_GUI_KEY.Name))
 setStatus("Running")
 
 while not stopped do
