@@ -1,9 +1,3 @@
-# Local-only files. The readable source and the encoder both contain
-# the secret key — keep them off GitHub.
-TweenToCoins.lua
-encode.py
-
-# Misc
 *.log
 .DS_Store
 Thumbs.db
