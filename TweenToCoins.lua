@@ -1099,8 +1099,21 @@ do
 	local CoreGui       = game:GetService("CoreGui")
 	local hopAttempted  = false
 
+	-- Emergency-hop signals can fire spuriously during the first few
+	-- seconds after the script loads (stale error message left in
+	-- GuiService from a previous session, NetworkClient children
+	-- shuffling during connection setup, ErrorPrompt template
+	-- instances already present in CoreGui). Ignore everything for
+	-- the first 10 seconds so we don't hop the moment we connect.
+	local EMERGENCY_GRACE_SECONDS = 10
+	local graceUntil              = os.clock() + EMERGENCY_GRACE_SECONDS
+
 	local function emergencyHop(reason)
 		if hopAttempted then return end
+		if os.clock() < graceUntil then
+			-- Silently ignore during grace.
+			return
+		end
 		hopAttempted = true
 		warn(("[CoinTween] Emergency hop: %s"):format(tostring(reason)))
 		pcall(setStatus, "Emergency hop: " .. tostring(reason))
@@ -1151,15 +1164,16 @@ do
 	end
 
 	-- 3) Roblox's kick/disconnect prompt has a predictable name in
-	-- CoreGui. If it appears, hop immediately instead of waiting on
-	-- the user to click Leave/Reconnect.
-	local function watchPrompt(d)
-		if d and d.Name == "ErrorPrompt" then
+	-- CoreGui. If a NEW one appears, hop immediately instead of
+	-- waiting on the user to click Leave/Reconnect. We deliberately
+	-- DO NOT scan existing descendants — Roblox keeps ErrorPrompt
+	-- template instances around in CoreGui from before our script
+	-- runs, and an initial sweep would trigger an instant hop.
+	CoreGui.DescendantAdded:Connect(function(d)
+		if d and d.Name == "ErrorPrompt" and os.clock() >= graceUntil then
 			emergencyHop("ErrorPrompt UI shown")
 		end
-	end
-	for _, d in ipairs(CoreGui:GetDescendants()) do watchPrompt(d) end
-	CoreGui.DescendantAdded:Connect(watchPrompt)
+	end)
 
 	-- 4) TeleportService failures — sometimes the hop itself fails
 	-- (e.g., target server is full). Try a vanilla teleport as fallback.
