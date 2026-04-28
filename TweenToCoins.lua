@@ -38,121 +38,23 @@ end
 if not isLikelyMM2() then return end
 
 -- =========================
--- Device detection + first-run prompt
+-- Device auto-detection (silent, no prompt)
 -- =========================
--- The script supports PC / Mobile / iPad. Some UI paths differ between
--- desktop and small-screen layouts (e.g. the account-coin label sits
--- under CrossPlatform.Shop.Medium on PC vs CrossPlatform.Shop.Small on
--- phone). On first run we ask the user which device they're on and
--- save the choice; subsequent runs skip the prompt.
-local DEVICE_FILE   = "TweenToCoins_device.txt"   -- written via executor's writefile
-local DEVICE        = nil   -- "pc" | "mobile" | "ipad"
-
-local function safeRead(path)
-	local ok, val = pcall(function() return readfile(path) end)
-	if ok and val and #val > 0 then return val end
-	return nil
-end
-local function safeWrite(path, content)
-	pcall(function() writefile(path, content) end)
-end
-
--- Restore saved device.
-local saved = safeRead(DEVICE_FILE)
-if saved == "pc" or saved == "mobile" or saved == "ipad" then
-	DEVICE = saved
-end
-
--- Auto-detect as a fallback. Heuristic: TouchEnabled + no MouseEnabled
--- = mobile. Screen aspect ratio hints at iPad vs phone.
-local function autoDetectDevice()
+-- Some UI paths differ between desktop and small-screen layouts (e.g.
+-- the account-coin label sits under CrossPlatform.Shop.Medium on PC vs
+-- CrossPlatform.Shop.Small on phone). Detect silently from
+-- UserInputService — no prompt, no saved file.
+local DEVICE = "pc"
+do
 	local UIS = game:GetService("UserInputService")
 	if UIS.TouchEnabled and not UIS.MouseEnabled then
 		local cam = workspace.CurrentCamera
-		if cam then
-			local size = cam.ViewportSize
-			local aspect = size.X / size.Y
-			-- iPads tend toward 4:3 (~1.33), phones toward 16:9 (~1.78).
-			if aspect < 1.5 then return "ipad" end
-		end
-		return "mobile"
+		local aspect = cam and (cam.ViewportSize.X / cam.ViewportSize.Y) or 1.78
+		DEVICE = (aspect < 1.5) and "ipad" or "mobile"
 	end
-	return "pc"
 end
-
--- Show a one-time GUI prompt asking the user to confirm device.
-local function askDevice()
-	local LocalPlayer = game:GetService("Players").LocalPlayer
-	local CoreGui     = game:GetService("CoreGui")
-	local promptGui = Instance.new("ScreenGui")
-	promptGui.Name = "MM2DevicePrompt"
-	promptGui.IgnoreGuiInset = true
-	promptGui.ResetOnSpawn = false
-	promptGui.DisplayOrder = 1000
-	pcall(function() promptGui.Parent = CoreGui end)
-	if not promptGui.Parent then promptGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
-
-	local backdrop = Instance.new("Frame")
-	backdrop.Size = UDim2.fromScale(1, 1)
-	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
-	backdrop.BackgroundTransparency = 0.4
-	backdrop.Parent = promptGui
-
-	local panel = Instance.new("Frame")
-	panel.AnchorPoint = Vector2.new(0.5, 0.5)
-	panel.Position = UDim2.fromScale(0.5, 0.5)
-	panel.Size = UDim2.fromOffset(360, 220)
-	panel.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
-	panel.BorderSizePixel = 0
-	panel.Parent = backdrop
-	local corner = Instance.new("UICorner") corner.CornerRadius = UDim.new(0, 12) corner.Parent = panel
-
-	local title = Instance.new("TextLabel")
-	title.Size = UDim2.new(1, 0, 0, 50)
-	title.Position = UDim2.new(0, 0, 0, 10)
-	title.BackgroundTransparency = 1
-	title.Text = "Which device are you on?"
-	title.TextColor3 = Color3.fromRGB(255, 215, 75)
-	title.Font = Enum.Font.GothamBlack
-	title.TextSize = 22
-	title.Parent = panel
-
-	local choice = nil
-	local function makeButton(label, val, x)
-		local b = Instance.new("TextButton")
-		b.Size = UDim2.fromOffset(100, 100)
-		b.Position = UDim2.fromOffset(x, 80)
-		b.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
-		b.Text = label
-		b.TextColor3 = Color3.fromRGB(240, 240, 240)
-		b.Font = Enum.Font.GothamBold
-		b.TextSize = 18
-		b.Parent = panel
-		local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, 8) c.Parent = b
-		b.MouseButton1Click:Connect(function() choice = val end)
-		b.TouchTap:Connect(function() choice = val end)
-		return b
-	end
-	makeButton("PC",     "pc",     20)
-	makeButton("Mobile", "mobile", 130)
-	makeButton("iPad",   "ipad",   240)
-
-	-- Block until a choice is made (or 30s timeout, then fall back to autodetect).
-	local started = tick()
-	while not choice and tick() - started < 30 do task.wait(0.1) end
-	promptGui:Destroy()
-	return choice or autoDetectDevice()
-end
-
-if not DEVICE then
-	DEVICE = askDevice()
-	safeWrite(DEVICE_FILE, DEVICE)
-	print(("[CoinTween] Device set to %s (saved)"):format(DEVICE))
-else
-	print(("[CoinTween] Device loaded: %s"):format(DEVICE))
-end
-
 local IS_MOBILE = (DEVICE == "mobile" or DEVICE == "ipad")
+print(("[CoinTween] Device: %s"):format(DEVICE))
 
 -- =========================
 -- Config
