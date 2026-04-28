@@ -38,6 +38,62 @@ end
 if not isLikelyMM2() then return end
 
 -- =========================
+-- Hop circuit breaker
+-- =========================
+-- Persists hop count across script reloads via writefile. If the
+-- script has triggered 3+ hops within the last 2 minutes, that's
+-- almost always a feedback loop (e.g. "MM2 keeps kicking us, we keep
+-- hopping back, get kicked again"). Disable all hopping for the rest
+-- of this session so we stop ping-ponging.
+local HOP_LOG_FILE   = "TweenToCoins_hops.txt"
+local HOP_LOOP_LIMIT = 3      -- this many hops in...
+local HOP_LOOP_WINDOW = 120   -- ...this many seconds = loop
+local HOPS_DISABLED  = false
+
+local function _readHopLog()
+	local ok, content = pcall(function() return readfile(HOP_LOG_FILE) end)
+	if not ok or not content or #content == 0 then return nil, nil end
+	local count, ts = content:match("(%-?%d+),(%-?%d+)")
+	return tonumber(count), tonumber(ts)
+end
+local function _writeHopLog(count, ts)
+	pcall(function() writefile(HOP_LOG_FILE, ("%d,%d"):format(count, ts)) end)
+end
+
+-- Called by every hop trigger immediately before TeleportService.
+-- Returns true if the hop should be allowed, false if we're already
+-- in a loop and should suppress.
+local function recordHopAndShouldAllow()
+	if HOPS_DISABLED then return false end
+	local now = os.time()
+	local count, lastTs = _readHopLog()
+	count = count or 0
+	if lastTs and (now - lastTs) < HOP_LOOP_WINDOW then
+		count = count + 1
+	else
+		count = 1
+	end
+	_writeHopLog(count, now)
+	if count >= HOP_LOOP_LIMIT then
+		HOPS_DISABLED = true
+		warn(("[CoinTween] %d hops in %ds — hop loop detected. ALL HOPS DISABLED."):format(count, HOP_LOOP_WINDOW))
+		return false
+	end
+	return true
+end
+
+-- On script load, check if we've been hopping a lot. If so, freeze
+-- hopping for this session right away (don't even try the first hop).
+do
+	local count, lastTs = _readHopLog()
+	if count and lastTs and (os.time() - lastTs) < HOP_LOOP_WINDOW and count >= HOP_LOOP_LIMIT then
+		HOPS_DISABLED = true
+		warn(("[CoinTween] Loaded with hop count %d (last %ds ago). Hops disabled this session.")
+			:format(count, os.time() - lastTs))
+	end
+end
+
+-- =========================
 -- Device auto-detection (silent, no prompt)
 -- =========================
 -- Some UI paths differ between desktop and small-screen layouts (e.g.
@@ -85,10 +141,13 @@ local STOP_KEY           = Enum.KeyCode.X
 local TOGGLE_GUI_KEY     = Enum.KeyCode.H
 
 -- Server hop
-local MIN_PLAYERS         = 5     -- hop if server population drops below this
+local MIN_PLAYERS         = 2     -- hop only on truly dead servers (was 5;
+                                  -- MM2 often has 3-4 player rounds and the
+                                  -- old threshold caused infinite hop loops)
 local SERVER_CHECK_PERIOD = 15    -- seconds between population checks
-local HOP_GRACE_PERIOD    = 30    -- seconds after join before the first hop check
-                                  -- (so we don't hop the moment we land before others load in)
+local HOP_GRACE_PERIOD    = 90    -- seconds after join before the first hop
+                                  -- check (longer = more time for player
+                                  -- replication after teleport)
 
 -- Low-rate hop: if our coins/hour falls below LOW_RATE_THRESHOLD after
 -- LOW_RATE_GRACE seconds in this server, hop to a fresh one. Catches dead
@@ -1042,6 +1101,10 @@ end
 
 local function hopServer()
 	if hopping then return end
+	if not recordHopAndShouldAllow() then
+		setStatus("Hop suppressed (loop detected)")
+		return
+	end
 	hopping = true
 	setStatus("Hopping server (low pop)")
 
@@ -1099,19 +1162,24 @@ do
 	local CoreGui       = game:GetService("CoreGui")
 	local hopAttempted  = false
 
-	-- Emergency-hop signals can fire spuriously during the first few
-	-- seconds after the script loads (stale error message left in
+	-- Emergency-hop signals can fire spuriously during the first
+	-- minute after script load (stale error message left in
 	-- GuiService from a previous session, NetworkClient children
 	-- shuffling during connection setup, ErrorPrompt template
-	-- instances already present in CoreGui). Ignore everything for
-	-- the first 10 seconds so we don't hop the moment we connect.
-	local EMERGENCY_GRACE_SECONDS = 10
+	-- instances added by other scripts, anti-AFK input quirks).
+	-- Long grace = no hop loop on the first few seconds.
+	local EMERGENCY_GRACE_SECONDS = 60
 	local graceUntil              = os.clock() + EMERGENCY_GRACE_SECONDS
 
 	local function emergencyHop(reason)
 		if hopAttempted then return end
 		if os.clock() < graceUntil then
 			-- Silently ignore during grace.
+			return
+		end
+		if not recordHopAndShouldAllow() then
+			-- Circuit breaker tripped: stop ping-ponging.
+			pcall(setStatus, "Emergency hop suppressed (loop)")
 			return
 		end
 		hopAttempted = true
