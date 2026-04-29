@@ -1731,102 +1731,128 @@ local function countInRange(originPos)
 end
 
 -- =========================
--- Auto-buy (emotes / gears / perks / pets / knives / guns)
+-- Auto-buy (v2 — UI-based discovery)
 -- =========================
--- Periodically sweep the runtime item catalogs in ReplicatedStorage
--- and call BuyItemNew on each item we haven't tried yet. Best-effort:
--- without exact source for MM2's shop modules, we discover items by
--- require()ing the loaded modules and iterating their tables. The
--- buy remote is fired in pcall so failures don't crash the loop.
-local AUTO_BUY               = true
-local AUTO_BUY_INTERVAL      = 90    -- seconds between full catalog sweeps
-local AUTO_BUY_RATE          = 0.3   -- delay between individual buy attempts (anti-spam)
-local AUTO_BUY_CATEGORIES    = {     -- ModuleScript names under Database.Sync
-	"Emotes", "Effects", "Toys", "Pets", "Knives", "Guns", "Shop", "Item",
-}
+-- v1 tried to require() ReplicatedStorage.Database.Sync.<Category>
+-- ModuleScripts. That fails on MM2 because those modules live
+-- server-side or are stripped from the client copy. v2 instead
+-- discovers items from the visible shop UI in PlayerGui (which
+-- definitely loads on the client) and brute-forces every buy-related
+-- remote, with verbose logging so we can iterate based on what
+-- actually fires.
+local AUTO_BUY            = true
+local AUTO_BUY_INTERVAL   = 120   -- seconds between sweeps
+local AUTO_BUY_RATE       = 0.3   -- per-item delay
+local AUTO_BUY_VERBOSE    = true  -- log every buy attempt's result
 
 task.spawn(function()
 	if not AUTO_BUY then return end
+	-- Wait for the shop UI to actually exist. MainGUI builds on first
+	-- character spawn — be patient before declaring "shop UI not found".
+	local pg = LocalPlayer:WaitForChild("PlayerGui", 10)
+	if not pg then return end
 
-	-- Resolve the buy remote. BuyItemNew is preferred (modern MM2);
-	-- BuyItem is the legacy version. Both are RemoteFunctions.
 	local rs       = game:GetService("ReplicatedStorage")
 	local remotes  = rs:FindFirstChild("Remotes")
 	local shop     = remotes and remotes:FindFirstChild("Shop")
-	local buyNew   = shop and shop:FindFirstChild("BuyItemNew")
-	local buyOld   = shop and shop:FindFirstChild("BuyItem")
-	if not (buyNew or buyOld) then
-		warn("[CoinTween] AutoBuy: no BuyItemNew or BuyItem remote — disabled.")
+	if not shop then
+		warn("[CoinTween] AutoBuy: ReplicatedStorage.Remotes.Shop not found.")
 		return
 	end
 
-	-- Resolve the item catalog. Database.Sync.<Category> are
-	-- ModuleScripts that return a table of items when require()d.
-	local db    = rs:FindFirstChild("Database")
-	local sync  = db and db:FindFirstChild("Sync")
-	if not sync then
-		warn("[CoinTween] AutoBuy: ReplicatedStorage.Database.Sync not found — disabled.")
-		return
-	end
-
-	local tried = {}   -- [itemName] = true (one attempt per item per session)
-
-	local function tryBuy(itemName)
-		if tried[itemName] then return end
-		tried[itemName] = true
-		-- Try BuyItemNew first, then fall back to BuyItem. Both with
-		-- (itemName) as the only arg — that's the most common signature
-		-- across MM2 versions. If neither works the function fails
-		-- silently and we move on.
-		if buyNew then
-			local ok, result = pcall(function()
-				return buyNew:InvokeServer(itemName)
-			end)
-			if ok and result then
-				print(("[CoinTween] Bought: %s (BuyItemNew → %s)"):format(itemName, tostring(result)))
-				return
-			end
-		end
-		if buyOld then
-			pcall(function() buyOld:InvokeServer(itemName) end)
+	-- Collect every buy/purchase-related remote.
+	local buyRemotes = {}
+	for _, child in ipairs(shop:GetChildren()) do
+		if (child:IsA("RemoteFunction") or child:IsA("RemoteEvent"))
+		   and (child.Name:find("Buy") or child.Name:find("Purchase") or child.Name:find("Get")) then
+			buyRemotes[#buyRemotes + 1] = child
 		end
 	end
+	print(("[CoinTween] AutoBuy: found %d buy/purchase/get remotes:"):format(#buyRemotes))
+	for _, r in ipairs(buyRemotes) do
+		print(("[CoinTween]   • %s (%s)"):format(r.Name, r.ClassName))
+	end
+	if #buyRemotes == 0 then return end
 
-	-- Recursively iterate a table to find string keys that look like
-	-- item identifiers. Many MM2 modules nest items under sub-categories.
-	local function collectItems(t, out, depth)
-		if type(t) ~= "table" or depth > 3 then return end
-		for k, v in pairs(t) do
-			if type(k) == "string" and k:len() > 1 and k:len() < 64 then
-				-- Heuristic: looks like an item name (alphanumeric + spaces)
-				if k:match("^[%w%s%-_'.]+$") then
-					out[#out + 1] = k
+	-- Walk the visible shop UI to gather candidate item names.
+	-- Path: PlayerGui.MainGUI.Game.Shop.Main.<Category>.ScrollFrame.Container.<Item>
+	-- Item is a Frame containing ItemName.Label (TextLabel) and a price.
+	local function discoverItems()
+		local items = {}
+		local mainGui = pg:FindFirstChild("MainGUI")
+		local gameFolder = mainGui and mainGui:FindFirstChild("Game")
+		local shopGui = gameFolder and gameFolder:FindFirstChild("Shop")
+		local main = shopGui and shopGui:FindFirstChild("Main")
+		if not main then
+			warn("[CoinTween] AutoBuy: PlayerGui.MainGUI.Game.Shop.Main not found.")
+			return items
+		end
+
+		for _, category in ipairs(main:GetChildren()) do
+			local scroll = category:FindFirstChild("ScrollFrame")
+			local container = scroll and scroll:FindFirstChild("Container")
+			if container then
+				for _, frame in ipairs(container:GetChildren()) do
+					local label = frame:FindFirstChild("ItemName", true)
+					if label then
+						local txt = label:FindFirstChildWhichIsA("TextLabel")
+						if txt and txt.Text and txt.Text ~= "" then
+							items[#items + 1] = { name = txt.Text, frame = frame.Name, category = category.Name }
+						end
+					end
+					-- Fallback: also include the frame's own name (often the item id).
+					if frame.Name and frame.Name:len() > 1 then
+						items[#items + 1] = { name = frame.Name, frame = frame.Name, category = category.Name }
+					end
 				end
 			end
-			if type(v) == "table" then collectItems(v, out, depth + 1) end
+		end
+		return items
+	end
+
+	local tried = {}   -- [itemName] = true to avoid retrying
+
+	local function attemptBuy(itemName, category, frameName)
+		if tried[itemName] then return end
+		tried[itemName] = true
+
+		-- Try every remote, every common arg variant, until ONE succeeds.
+		local nameVariants = { itemName, itemName:gsub("%s+", ""), itemName:lower() }
+		for _, remote in ipairs(buyRemotes) do
+			for _, variant in ipairs(nameVariants) do
+				local ok, result = pcall(function()
+					if remote:IsA("RemoteFunction") then
+						return remote:InvokeServer(variant)
+					else
+						remote:FireServer(variant)
+						return "fired"
+					end
+				end)
+				if AUTO_BUY_VERBOSE then
+					print(("[CoinTween]   buy '%s' [%s] via %s(%s) → ok=%s result=%s")
+						:format(itemName, category, remote.Name, variant, tostring(ok), tostring(result)))
+				end
+				if ok and result and result ~= false and result ~= "fired" then
+					print(("[CoinTween] ✓ Bought %s via %s"):format(itemName, remote.Name))
+					return   -- success, move on to next item
+				end
+			end
 		end
 	end
 
 	while not stopped do
-		local totalTried = 0
-		for _, cat in ipairs(AUTO_BUY_CATEGORIES) do
-			local module = sync:FindFirstChild(cat)
-			if module then
-				local ok, contents = pcall(require, module)
-				if ok and type(contents) == "table" then
-					local items = {}
-					collectItems(contents, items, 1)
-					for _, itemName in ipairs(items) do
-						if stopped then break end
-						tryBuy(itemName)
-						totalTried = totalTried + 1
-						task.wait(AUTO_BUY_RATE)
-					end
-				end
-			end
+		local items = discoverItems()
+		print(("[CoinTween] AutoBuy: discovered %d items in shop UI."):format(#items))
+		for _, it in ipairs(items) do
 			if stopped then break end
+			attemptBuy(it.name, it.category, it.frame)
+			task.wait(AUTO_BUY_RATE)
 		end
-		print(("[CoinTween] AutoBuy sweep done — %d items attempted (cumulative)."):format(totalTried))
+		print(("[CoinTween] AutoBuy: sweep complete (%d unique items tried so far)."):format((function()
+			local n = 0
+			for _ in pairs(tried) do n += 1 end
+			return n
+		end)()))
 		task.wait(AUTO_BUY_INTERVAL)
 	end
 end)
